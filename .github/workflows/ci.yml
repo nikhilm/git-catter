@@ -1,0 +1,29 @@
+on: [push, pull_request]
+name: CI
+jobs:
+  build:
+    name: "Build on Racket '${{ matrix.racket-version }}' (${{ matrix.racket-variant }})"
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        racket-version: ["stable", "current"]
+        racket-variant: ["BC", "CS"]
+        include:
+          - racket-version: current
+            experimental: true
+    steps:
+      - uses: actions/checkout@v3.1.0
+      - uses: Bogdanp/setup-racket@v1.9.1
+        with:
+          architecture: x64
+          distribution: full
+          variant: ${{ matrix.racket-variant }}
+          version: ${{ matrix.racket-version }}
+      - name: Installing git-catter and its dependencies
+        run: raco pkg install --no-docs --auto --name git-catter
+      - name: Compiling git-catter and building its docs
+        run: raco setup --check-pkg-deps --unused-pkg-deps git-catter
+      - name: Testing git-catter
+        run: raco test -x -p git-catter
