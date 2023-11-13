@@ -39,20 +39,19 @@
                   ; the manager will notice the thread dying and notify all pending requests.
                   (error 'unexpected-eof))
               ]
+              ; TODO: Handle missing
              [_
               (log-git-cat-error "Match failed for ~a" line)
               ; TODO: Handle the case where we get non-matching but not EOF for some reason
               ; reloop to handle eof.
               (loop)])))))))
 
-(define (make-manager req-ch)
+(define (make-manager repo-path req-ch)
   (thread/suspend-to-kill
    (lambda ()
-     ; TODO: How to maintain kill safety in case the subprocess raises an exception? or the reader code throws an exception?
-     ; i.e. how do we prevent callers from getting blocked forever, and new callers should receive the original error
      (define-values (cat-proc proc-out proc-in _)
        (parameterize ([current-subprocess-custodian-mode 'kill])
-         ; current-output-port is not a valid file-stream-port? when run in DrRacket.
+         ; current-error-port is not a valid file-stream-port? when run in DrRacket.
          ; this is dumb because we are losing
          (let ([err-port (if (file-stream-port? (current-error-port))
                              (current-error-port)
@@ -60,11 +59,13 @@
                                (log-git-cat-debug "stderr is not a file-stream. Using ~a instead." fn)
                                (open-output-file fn #:exists 'truncate)))])
            (subprocess #f #f err-port
+                       ; TODO: Lookup from PATH.
                        "/usr/bin/git"
-                       "-C" "/home/nikhil/nikhilism.com"
+                       "-C" repo-path
                        "cat-file"
                        "--batch=%(objectname) %(objecttype) %(objectsize) %(rest)"))))
 
+     (file-stream-buffer-mode proc-in 'line)
      (define reader-resp-ch (make-channel))
      (define reader (make-reader proc-out reader-resp-ch))
 
@@ -90,16 +91,12 @@
                              ; This does assume the file path is printable.
                              (let* ([key (format "~a:~a" commit path)]
                                     [p (Pending key resp-ch nack-evt)]
-                                    
                                     ; everything after the first whitespace in the input is replaced in the %(rest)
                                     ; in the output. Use this to correlate the key.
                                     [write-req
                                      (string->bytes/utf-8 (format "~a ~a~n" key key))])
-                               (loop
-                                (cons p pending)
-                                (cons
-                                 write-req
-                                 write-requests)
+                               (loop (cons p pending)
+                                (cons write-req write-requests)
                                 response-attempts
                                 closed?))))]))
 
@@ -161,9 +158,6 @@
            (handle-evt (write-bytes-avail-evt req proc-in)
                        (lambda (_)
                          (log-git-cat-debug "Wrote to cat-files stdin ~a" req)
-                         ; TODO: Is there a way to make flush not necessary?
-                         ; seems like it may block?
-                         (flush-output proc-in)
                          (loop pending (remq req write-requests) response-attempts closed?))))
          
          (for/list ([res (in-list response-attempts)])
@@ -172,15 +166,16 @@
               ; regardless of which branch gets chosen, just remove the attempt.
               (choice-evt (channel-put-evt ch response) nack-evt)
               (lambda (_)
+                       (log-git-cat-info "Got resp att")
                 (loop pending
                       write-requests
                       (remq res response-attempts)
                       closed?)))))))))))
 
-; TODO: Eventually accept repo path.
-(define (make-catter)
+(define (make-catter repo-path)
   (define req-ch (make-channel))
-  (catter req-ch (make-manager req-ch)))
+  (catter req-ch (make-manager repo-path req-ch)))
+
 
 (define (catter-read cat commit file-path)
   ; in case the caller thread goes away, the nack-evt will become ready.
@@ -224,15 +219,14 @@
   (define commit "688600a4be5f016acfbf6c191562913b490ed687")
   (define catter #f)
   (parameterize ([current-custodian (make-custodian)])
-    (set! catter (make-catter))
+    (set! catter (make-catter "/home/nikhil/nikhilism.com"))
     (define tasks (for/list ([file files])
                     (thread
                      (lambda ()
                        (do-stuff-with-file file (catter-read catter commit file))))))
     (map sync tasks)
     (custodian-shutdown-all (current-custodian)))
-  (log-git-cat-info "Catter is still ~v" catter)
-  (catter-read catter commit "content/post/2023/kubectl-tunnel.md")
+  (catter-read catter commit "content/post/2023/gradient-descent-racket.md")
   void)
 
 ; TODO: Write a test where we create multiple catters in a loop. add some sleeps and intentional gcs
