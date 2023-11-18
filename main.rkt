@@ -41,10 +41,16 @@
                     (channel-put resp-ch (cons key contents))
                     (loop))
                   ; subproc must've exited/catter stopped.
-                  (error 'unexpected-eof))
-              ]
-             ; TODO: Handle missing file
-             )))))))
+                  (error 'unexpected-eof))]
+             ; (or ...) doesn't allow introducing sub-patterns to match against, so use regexp.
+             [(list object-name (regexp #rx"^missing|ambiguous$" msg))
+              (channel-put resp-ch
+                           ; In case of missing, the returned object-name is what we passed in, so it can be used as the key.
+                           (cons object-name
+                                 (exn:fail
+                                  (format "~a object ~v" (car msg) object-name)
+                                  (current-continuation-marks))))
+              (loop)])))))))
 
 (define (make-manager repo-path req-ch stop-ch)
   (thread/suspend-to-kill
@@ -74,11 +80,10 @@
                 [closed? #f])
        (apply
         sync
-        ; -> new file path. send to reader
+        ; New file path. send to reader.
         (handle-evt req-ch
                     (match-lambda
                       [(Request commit path resp-ch nack-evt)
-                       (log-git-cat-debug "Got a new request")
                        (if closed?
                            (loop pending
                                  write-requests
@@ -100,7 +105,6 @@
         (handle-evt reader-resp-ch
                     (match-lambda
                       [(cons got-key contents)
-                       (log-git-cat-debug "Got a response ~a" got-key)
                        ; not sure if there is an elegant way to avoid this mutation.
                        (define found #f)
                        (define new-pending
@@ -152,20 +156,16 @@
          (for/list ([req (in-list write-requests)])
            (handle-evt (write-bytes-avail-evt req proc-in)
                        (lambda (_)
-                         (log-git-cat-debug "Wrote to cat-files stdin ~a" req)
                          (loop pending (remq req write-requests) response-attempts closed?))))
          
          (for/list ([res (in-list response-attempts)])
            (match-let ([(Response-Attempt ch nack-evt response) res])
-             (handle-evt
-              ; regardless of which branch gets chosen, just remove the attempt.
-              (choice-evt (channel-put-evt ch response) nack-evt)
-              (lambda (_)
-                (log-git-cat-debug "Wrote response/got nack event")
-                (loop pending
-                      write-requests
-                      (remq res response-attempts)
-                      closed?)))))))))))
+             (handle-evt (choice-evt (channel-put-evt ch response) nack-evt)
+                         (lambda (_)
+                           (loop pending
+                                 write-requests
+                                 (remq res response-attempts)
+                                 closed?)))))))))))
 
 (define (make-catter repo-path)
   (define req-ch (make-channel))
@@ -190,7 +190,6 @@
                  (thread-resume (catter-mgr cat) (current-thread))
                  ; send the request.
                  (channel-put (catter-req-ch cat) (Request commit file-path resp-ch nack-evt))
-                 ; since the channel is a synchronization event, we can directly return it. No handle-evt required!
                  resp-ch)))
   (handle-evt evt
               (lambda (resp)
@@ -203,29 +202,16 @@
 
 
 (module+ main
-  ; This is a pretend program
   (define files
     (list
      "content/post/2023/canadian-express-entry-experience.md"
      "content/post/2023/gossip-glomers-racket.md"
-     "content/post/2023/gradient-descent-racket.md"
-     ;    "content/post/2023/kubectl-tunnel.md"
-     ;    "content/post/2023/making-sense-of-continuations.md"
-     ;    "content/post/2023/nuphy-air75-wireless-linux.md"
-     ;    "content/post/2023/python-idiomatic-file-iteration-bad-performance.md"
-     ;    "content/post/2023/racket-beyond-languages.md"
-     ;    "content/post/2023/remote-dbus-notifications.md"
+     "content/post/2023/gradient-descent-racket.m"
+     "content/post/2023/making-sense-of-continuations.md"
+     "content/post/2023/nuphy-air75-wireless-linux.md"
      ))
 
   (define commit "688600a4be5f016acfbf6c191562913b490ed687")
-  (parameterize ([current-custodian (make-custodian)])
-      (define catter (make-catter "/home/nikhil/nikhilism.com"))
-      (define tasks (for/list ([file files])
-                      (thread
-                       (lambda ()
-                         (do-stuff-with-file file (catter-read catter commit file))))))
-      (map sync tasks)
-      (custodian-shutdown-all (current-custodian)))
 
   (define catter (make-catter "/home/nikhil/nikhilism.com"))
   (define tasks (cons
