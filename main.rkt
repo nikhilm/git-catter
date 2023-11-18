@@ -1,8 +1,12 @@
-#lang racket
+#lang racket/base
+
+(require racket/file)
+(require racket/match)
+(require racket/string)
 
 (define-logger git-cat)
 
-(struct catter (req-ch mgr))
+(struct catter (req-ch stop-ch mgr))
 
 (struct Request (commit path ch nack-evt))
 (struct Pending (key ch nack-evt))
@@ -13,7 +17,8 @@
                     (Pending-nack-evt p)
                     resp))
 
-; reader is a separate thread since it has to preserve some state implicitly to know whether to read the header or the contents.
+; reader is a separate thread so it can be treated like a co-routine with its own stack.
+; this makes the reading logic nice and sequential.
 (define (make-reader proc-out resp-ch)
   (thread
    (lambda ()
@@ -34,19 +39,13 @@
                     (read-char)
                     (channel-put resp-ch (cons key contents))
                     (loop))
-                  ; subproc must've exited.
-                  ; just error out here.
-                  ; the manager will notice the thread dying and notify all pending requests.
+                  ; subproc must've exited/catter stopped.
                   (error 'unexpected-eof))
               ]
-              ; TODO: Handle missing
-             [_
-              (log-git-cat-error "Match failed for ~a" line)
-              ; TODO: Handle the case where we get non-matching but not EOF for some reason
-              ; reloop to handle eof.
-              (loop)])))))))
+             ; TODO: Handle missing file
+             )))))))
 
-(define (make-manager repo-path req-ch)
+(define (make-manager repo-path req-ch stop-ch)
   (thread/suspend-to-kill
    (lambda ()
      (define-values (cat-proc proc-out proc-in _)
@@ -59,8 +58,7 @@
                                (log-git-cat-debug "stderr is not a file-stream. Using ~a instead." fn)
                                (open-output-file fn #:exists 'truncate)))])
            (subprocess #f #f err-port
-                       ; TODO: Lookup from PATH.
-                       "/usr/bin/git"
+                       (find-executable-path "git")
                        "-C" repo-path
                        "cat-file"
                        "--batch=%(objectname) %(objecttype) %(objectsize) %(rest)"))))
@@ -87,18 +85,16 @@
                                   (Response-Attempt resp-ch nack-evt (exn:fail "catter stopped" (current-continuation-marks)))
                                   response-attempts)
                                  closed?)
-                           (begin
-                             ; This does assume the file path is printable.
-                             (let* ([key (format "~a:~a" commit path)]
-                                    [p (Pending key resp-ch nack-evt)]
-                                    ; everything after the first whitespace in the input is replaced in the %(rest)
-                                    ; in the output. Use this to correlate the key.
-                                    [write-req
-                                     (string->bytes/utf-8 (format "~a ~a~n" key key))])
-                               (loop (cons p pending)
-                                (cons write-req write-requests)
-                                response-attempts
-                                closed?))))]))
+                           (let* ([key (format "~a:~a" commit path)]
+                                  [p (Pending key resp-ch nack-evt)]
+                                  ; everything after the first whitespace in the input is replaced in the %(rest)
+                                  ; in the output. Use this to correlate the key.
+                                  [write-req
+                                   (string->bytes/utf-8 (format "~a ~a~n" key key))])
+                             (loop (cons p pending)
+                                   (cons write-req write-requests)
+                                   response-attempts
+                                   closed?)))]))
 
         (handle-evt reader-resp-ch
                     (match-lambda
@@ -119,25 +115,26 @@
                              write-requests
                              (if found
                                  (cons found response-attempts)
-                                 response-attempts)
+                                 (begin
+                                   (log-git-cat-debug "Dropping response because no pending request found")
+                                   response-attempts))
                              closed?)]))
 
-        ; once the subproc is dead, these events will always be "ready"
-        ; avoid looping forever on them
+        ; once the subproc is dead, some of these events will always be "ready".
+        ; avoid looping forever on them.
         ; this is correct because this is the only case that sets closed? to true.
         (if closed?
             never-evt
-            (handle-evt (choice-evt cat-proc reader)
+            (handle-evt (choice-evt cat-proc reader stop-ch)
                         (lambda (_)
                           (close-output-port proc-in)
-                          (close-input-port proc-out)
                           (subprocess-wait cat-proc)
                           (define status (subprocess-status cat-proc))
                           (when (not (zero? status))
                             (log-git-cat-error "subprocess exited with non-zero exit code: ~a" status))
                           (define new-puts
                             (map
-                             (λ (p)
+                             (lambda (p)
                                (pending->response p (exn:fail "terminated" (current-continuation-marks))))
                              pending))
                           (loop null
@@ -166,7 +163,7 @@
               ; regardless of which branch gets chosen, just remove the attempt.
               (choice-evt (channel-put-evt ch response) nack-evt)
               (lambda (_)
-                       (log-git-cat-info "Got resp att")
+                (log-git-cat-debug "Wrote response/got nack event")
                 (loop pending
                       write-requests
                       (remq res response-attempts)
@@ -174,8 +171,12 @@
 
 (define (make-catter repo-path)
   (define req-ch (make-channel))
-  (catter req-ch (make-manager repo-path req-ch)))
+  (define stop-ch (make-channel))
+  (catter req-ch stop-ch (make-manager repo-path req-ch stop-ch)))
 
+(define (catter-stop! cat)
+  (thread-resume (catter-mgr cat) (current-thread))
+  (channel-put (catter-stop-ch cat) 'stop))
 
 (define (catter-read cat commit file-path)
   ; in case the caller thread goes away, the nack-evt will become ready.
@@ -194,8 +195,6 @@
   (if (exn:fail? resp)
       (raise resp)
       resp))
-
-; TODO: Offer a catter-stop!
 
 (define (do-stuff-with-file file-path contents)
   (printf "~a contents ~a~n" file-path contents))
@@ -218,15 +217,25 @@
 
   (define commit "688600a4be5f016acfbf6c191562913b490ed687")
   (define catter #f)
-  (parameterize ([current-custodian (make-custodian)])
-    (set! catter (make-catter "/home/nikhil/nikhilism.com"))
-    (define tasks (for/list ([file files])
-                    (thread
-                     (lambda ()
-                       (do-stuff-with-file file (catter-read catter commit file))))))
-    (map sync tasks)
-    (custodian-shutdown-all (current-custodian)))
-  (catter-read catter commit "content/post/2023/gradient-descent-racket.md")
+  #;(parameterize ([current-custodian (make-custodian)])
+      (set! catter (make-catter "/home/nikhil/nikhilism.com"))
+      (define tasks (for/list ([file files])
+                      (thread
+                       (lambda ()
+                         (do-stuff-with-file file (catter-read catter commit file))))))
+      (map sync tasks)
+      (custodian-shutdown-all (current-custodian)))
+  ;(catter-read catter commit "content/post/2023/gradient-descent-racket.md")
+
+  (set! catter (make-catter "/home/nikhil/nikhilism.com"))
+  (define tasks (cons
+                 (thread (lambda () (sleep 0.04) #;(catter-stop! catter)))
+                 (for/list ([file files])
+                   (thread
+                    (lambda ()
+                      (do-stuff-with-file file (catter-read catter commit file)))))))
+  (map sync tasks)
+  (catter-stop! catter)
   void)
 
 ; TODO: Write a test where we create multiple catters in a loop. add some sleeps and intentional gcs
