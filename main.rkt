@@ -1,6 +1,7 @@
 #lang racket/base
 
 (require racket/file)
+(require racket/function)
 (require racket/match)
 (require racket/string)
 
@@ -115,9 +116,7 @@
                              write-requests
                              (if found
                                  (cons found response-attempts)
-                                 (begin
-                                   (log-git-cat-debug "Dropping response because no pending request found")
-                                   response-attempts))
+                                 response-attempts)
                              closed?)]))
 
         ; once the subproc is dead, some of these events will always be "ready".
@@ -134,8 +133,7 @@
                             (log-git-cat-error "subprocess exited with non-zero exit code: ~a" status))
                           (define new-puts
                             (map
-                             (lambda (p)
-                               (pending->response p (exn:fail "terminated" (current-continuation-marks))))
+                             (curryr pending->response (exn:fail "terminated" (current-continuation-marks)))
                              pending))
                           (loop null
                                 null
@@ -181,20 +179,24 @@
 (define (catter-read cat commit file-path)
   ; in case the caller thread goes away, the nack-evt will become ready.
   ; this allows the catter to remove callers no longer awaiting responses.
-  (define resp (sync
-                (nack-guard-evt
-                 (lambda (nack-evt)
-                   ; response will go here
-                   (define resp-ch (make-channel))
-                   ; ensure the manager starts running with our custodian chain.
-                   (thread-resume (catter-mgr cat) (current-thread))
-                   ; send the request.
-                   (channel-put (catter-req-ch cat) (Request commit file-path resp-ch nack-evt))
-                   ; since the channel is a synchronization event, we can directly return it. No handle-evt required!
-                   resp-ch))))
-  (if (exn:fail? resp)
-      (raise resp)
-      resp))
+  (sync (catter-read-evt cat commit file-path)))
+
+(define (catter-read-evt cat commit file-path)
+  (define evt (nack-guard-evt
+               (lambda (nack-evt)
+                 ; response will go here
+                 (define resp-ch (make-channel))
+                 ; ensure the manager starts running with our custodian chain.
+                 (thread-resume (catter-mgr cat) (current-thread))
+                 ; send the request.
+                 (channel-put (catter-req-ch cat) (Request commit file-path resp-ch nack-evt))
+                 ; since the channel is a synchronization event, we can directly return it. No handle-evt required!
+                 resp-ch)))
+  (handle-evt evt
+              (lambda (resp)
+                (if (exn:fail? resp)
+                    (raise resp)
+                    resp))))
 
 (define (do-stuff-with-file file-path contents)
   (printf "~a contents ~a~n" file-path contents))
@@ -216,18 +218,16 @@
      ))
 
   (define commit "688600a4be5f016acfbf6c191562913b490ed687")
-  (define catter #f)
-  #;(parameterize ([current-custodian (make-custodian)])
-      (set! catter (make-catter "/home/nikhil/nikhilism.com"))
+  (parameterize ([current-custodian (make-custodian)])
+      (define catter (make-catter "/home/nikhil/nikhilism.com"))
       (define tasks (for/list ([file files])
                       (thread
                        (lambda ()
                          (do-stuff-with-file file (catter-read catter commit file))))))
       (map sync tasks)
       (custodian-shutdown-all (current-custodian)))
-  ;(catter-read catter commit "content/post/2023/gradient-descent-racket.md")
 
-  (set! catter (make-catter "/home/nikhil/nikhilism.com"))
+  (define catter (make-catter "/home/nikhil/nikhilism.com"))
   (define tasks (cons
                  (thread (lambda () (sleep 0.04) #;(catter-stop! catter)))
                  (for/list ([file files])
