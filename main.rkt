@@ -1,5 +1,7 @@
 #lang racket/base
 
+; Should we convert this to scribble/lp2?
+
 (require racket/file)
 (require racket/function)
 (require racket/match)
