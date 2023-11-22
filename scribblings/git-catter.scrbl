@@ -2,7 +2,7 @@
 @require[@for-label[racket/base]]
 
 @title{A practical example of kill-safe, concurrent programming in Racket}
-@author{Nikhil Marathe}
+@author[(author+email "Nikhil Marathe" "me@nikhilism.com" #:obfuscate? #t)]
 
 @hyperlink["https://racket-lang.org"]{Racket's} default concurrency model is based on green threads. It uses a model based on ConcurrentML (CML), which is very similar to Go, but allows further composition of concurrency primitives. In @hyperlink["https://nikhilism.com/post/2023/racket-beyond-languages/#concurrentml-inspired-concurrency"]{one of my posts} I had given a quick summary of this and pointers to other resources. I thought it would be good to walk through building a somewhat useful concurrent program to show how to use it. As an experiment, this is written as a literate program, using @hyperlink["https://docs.racket-lang.org/scribble-lp2-manual/index.html"]{scribble/lp2/manual}
 
@@ -172,7 +172,8 @@ The reader is a regular thread, since kill-safety doesn't require it to stay sus
             (parameterize ([current-input-port proc-out])
               <reader-loop>))))]
 
-The reader loop is fairly straightforward
+The reader loop is fairly straightforward.
+
 @chunk[<reader-loop>
        (let loop ()
          (define line (read-line))
@@ -196,6 +197,8 @@ It tries to read one line, which is assumed to be the metadata line. This is spl
 
 We must also handle some error cases in the batch output. These can happen if the input commit/file-path combination was invalid. Unlike end-of-file, these are user errors and should be relayed to the caller. So we match those forms, and then create an @racket[exn:fail] object with some extra information. That is written out to the channel, with other parts of the API knowing how to handle exceptions.
 
+While @racket[match] provides an @code{or} matcher, it doesn't allow binding the match to an identifier. We need the message so we can tell the caller what happened, so we use a @racket[regexp] matcher.
+
 @chunk[<error-handling>
        [(list object-name (regexp #rx"^missing|ambiguous$" msg))
         (channel-put resp-ch
@@ -206,8 +209,50 @@ We must also handle some error cases in the batch output. These can happen if th
                             (current-continuation-marks))))
         (loop)]]
 
-@section{Scratch}
+All other exceptions will cause the reader to fail, and the manager will observe that.
 
+@section{The Manager}
+
+This is the crux of the program. We are going to continue from where we left off in @code{<make-manager>}. We will observe several useful features of the CML model here.
+
+The main standout is @racket[sync], which blocks on an entire sequence of events, and proceeds
+when @emph{exactly one of them} is ready for synchronization. TODO: Link to andy wingo explanation of how this is done. Unlike Go's @code{select} statement, the sequence can be built up dynamically.
+
+The other is useful primitives like @racket[handle-evt] that allow us to associate behaviors with events, while preserving composition.
+
+@margin-note{Technically, Go has @hyperlink["https://pkg.go.dev/reflect#Select"]{reflect.Select()} which allows a list of cases, but I don't think it is widely used in practice.}
+
+@subsection{The Manager Loop}
+
+The manager is an infinite loop that maintains 3 lists and a boolean.
+
+@itemlist[#:style 'ordered
+          @item{@code{pending} is a list of @racket[Pending] instances, tracking outstanding @code{cat-file} requests that have been accepted and for whom we are awaiting a response from the subprocess.}
+          @item{@code{write-requests} is a list of @racket[bytes] containing UTF-8 encoded lines we want to write to the subprocesses' standard input. I'll explain why this exists below.}
+          @item{@code{response-attempts} is a list of @racket[Response-Attempt]s. On each loop iteration we will try to send a response back to the thread that issued the request.}
+          @item{@code{closed?} a boolean that tracks whether this catter is no longer operational, due to clean shutdown or error.}]
+
+The structs in these lists are:
+
+@chunk[<useful-structs>
+       (struct Request (commit path ch nack-evt))
+       (struct Pending (key ch nack-evt))
+       (struct Response-Attempt (ch nack-evt resp))
+
+       (define (pending->response p resp)
+         (Response-Attempt (Pending-ch p)
+                           (Pending-nack-evt p)
+                           resp))]
+
+@racket[Request]s are passed to the manager thread by @code{<catter-read-evt>}.
+
+@racket[Pending] tracks the key associated with the request, the channel the calling thread expects a response on, and a @emph{negative acknowledgement} (NACK) event, which will be used for cancellation.
+
+Once the subprocess returns a response, a @racket[Pending] request becomes a @racket[Response-Attempt], using the @racket[pending->response] helper. @code{resp} is either a @racket[bytes] containing the file contents or an @racket[error].
+
+The loop itself is a single call to @racket[sync]. However each event in the call has some complexity, so the overall code is long. Let's look at it one at at time. @bold{The one invariant we must preserve is that @code{loop} always calls itself regardless of which event gets selected}.
+
+We use @racket[apply] plus @racket[append] to assemble the various combinations of single events and lists that we need to pass to @racket[sync]. This means @racket[sync] may be waiting on tens of events at once. Each event is going to have extra behavior associated with it using @racket[handle-evt], all of which promise to call the loop again.
 
 @chunk[<manager-loop>
        (let loop ([pending null]
@@ -216,117 +261,207 @@ We must also handle some error cases in the batch output. These can happen if th
                   [closed? #f])
          (apply
           sync
-          ; New file path. send to reader.
-          (handle-evt req-ch
-                      (match-lambda
-                        [(Request commit path resp-ch nack-evt)
-                         (if closed?
-                             (loop pending
-                                   write-requests
-                                   (cons
-                                    (Response-Attempt resp-ch nack-evt (exn:fail "catter stopped" (current-continuation-marks)))
-                                    response-attempts)
-                                   closed?)
-                             (let* ([key (format "~a:~a" commit path)]
-                                    [p (Pending key resp-ch nack-evt)]
-                                    ; everything after the first whitespace in the input is replaced in the %(rest)
-                                    ; in the output. Use this to correlate the key.
-                                    [write-req
-                                     (string->bytes/utf-8 (format "~a ~a~n" key key))])
-                               (loop (cons p pending)
-                                     (cons write-req write-requests)
-                                     response-attempts
-                                     closed?)))]))
-
-          (handle-evt reader-resp-ch
-                      (match-lambda
-                        [(cons got-key contents)
-                         ; not sure if there is an elegant way to avoid this mutation.
-                         (define found #f)
-                         (define new-pending
-                           (filter
-                            (lambda (p)
-                              (if (and (not found) (equal? got-key (Pending-key p)))
-                                  (begin
-                                    (set! found (pending->response p contents))
-                                    #f)
-                                  #t))
-                            pending))
-                         (loop new-pending
-                               write-requests
-                               (if found
-                                   (cons found response-attempts)
-                                   response-attempts)
-                               closed?)]))
-
-          ; once the subproc is dead, some of these events will always be "ready".
-          ; avoid looping forever on them.
-          ; this is correct because this is the only case that sets closed? to true.
-          (if closed?
-              never-evt
-              (handle-evt (choice-evt cat-proc reader stop-ch)
-                          (lambda (_)
-                            (close-output-port proc-in)
-                            (subprocess-wait cat-proc)
-                            (define status (subprocess-status cat-proc))
-                            (when (not (zero? status))
-                              (log-git-cat-error "subprocess exited with non-zero exit code: ~a" status))
-                            (define new-puts
-                              (map
-                               (curryr pending->response (exn:fail "terminated" (current-continuation-marks)))
-                               pending))
-                            (loop null
-                                  null
-                                  (append new-puts response-attempts)
-                                  #t))))
-       
+          
+          <new-request>
+          <reader-response>
+          <stop>
           (append
-           (for/list ([req (in-list pending)])
-             (handle-evt (Pending-nack-evt req)
-                         (lambda (_)
-                           (loop (remq req pending)
-                                 write-requests
-                                 response-attempts
-                                 closed?))))
-         
-           (for/list ([req (in-list write-requests)])
-             (handle-evt (write-bytes-avail-evt req proc-in)
-                         (lambda (_)
-                           (loop pending (remq req write-requests) response-attempts closed?))))
-         
-           (for/list ([res (in-list response-attempts)])
-             (match-let ([(Response-Attempt ch nack-evt response) res])
-               (handle-evt (choice-evt (channel-put-evt ch response) nack-evt)
-                           (lambda (_)
-                             (loop pending
-                                   write-requests
-                                   (remq res response-attempts)
-                                   closed?))))))))]
+           <pending-requests>
+           <submit-inputs>
+           <response-attempts>)))]
+
+To restate, each iteration of the loop, @racket[sync] will pick @emph{one} event out of any that are ready for synchronization. It will return the synchronization result of that event. Our events are actually wrapper events returned by @racket[handle-evt]. This means, when the wrapped event is ready for synchronization, the wrapper is also ready. However, the synchronization result of the event from @racket[handle-evt] is the return value of the function provided as the second argument of @racket[handle-evt]. Due to Racket's tail call optimizations, it is safe and fast for these functions to call @code{loop} as long as it is done in tail position.
+
+@subsection{Handling a new request}
+
+@chunk[<new-request>
+       (handle-evt req-ch
+                   (match-lambda
+                     [(Request commit path resp-ch nack-evt)
+                      (if closed?
+                          (loop pending
+                                write-requests
+                                (cons
+                                 (Response-Attempt resp-ch nack-evt (exn:fail "catter stopped" (current-continuation-marks)))
+                                 response-attempts)
+                                closed?)
+                          (let* ([key (format "~a:~a" commit path)]
+                                 [p (Pending key resp-ch nack-evt)]
+                                 [write-req
+                                  (string->bytes/utf-8 (format "~a ~a~n" key key))])
+                            (loop (cons p pending)
+                                  (cons write-req write-requests)
+                                  response-attempts
+                                  closed?)))]))]
+
+When we receive a new request from other threads, it will come in on the @code{req-ch} channel as a @racket[Request]. The synchronization result of a channel is the value received on the channel. We can use the convenient @racket[match-lambda] to directly create a function that will bind to the members of the struct.
+
+If the catter is already closed, we don't create a pending request. Instead we queue up a response attempt to the calling thread and continue looping. This handles the kill-safety aspect, where callers can continue to rely on the catter responding to them, as long as they have a reference to it.
+
+In the common case where the catter is running, we create a key using the commit and path. We do this because the object name of the response will not be the commit+file path, so we need a way to associate the request and response. The key is also the input request object name. We rely on @code{cat-file}'s input syntax treating everything after the object name as something that will be echoed back in the @code{%(rest)} output format. We loop with this request line ready to be written.
+
+@margin-note{TODO: Note about how key is not strictly required.}
+
+@subsection{Handling responses from the Reader}
+
+The next possible event is the reader responding with a @racket[pair] of the key and contents. Handling it is straightforward. This handler tries to find an entry in pending that matches the key. It creates a @racket[Response-Attempt] from that, and then removes it from the pending list (by returning @racket[#f] to the @racket[filter]). It loops again with the two modified lists.
+
+@margin-note{If anybody knows how to express the @racket[filter] in a nicer way, please tell me!}
+
+@chunk[<reader-response>
+       (handle-evt reader-resp-ch
+                   (match-lambda
+                     [(cons got-key contents)
+                      (define found #f)
+                      (define new-pending
+                        (filter
+                         (lambda (p)
+                           (if (and (not found) (equal? got-key (Pending-key p)))
+                               (begin
+                                 (set! found (pending->response p contents))
+                                 #f)
+                               #t))
+                         pending))
+                      (loop new-pending
+                            write-requests
+                            (if found
+                                (cons found response-attempts)
+                                response-attempts)
+                            closed?)]))]
+
+@subsection{Events that stop the catter}
+
+There are 3 situations in which the catter can no longer process new requests.
+
+@itemlist[#:style 'ordered
+          @item{The subprocess exits. This could happen for a multitude of reasons, including the user killing the process or it encountering an error. The Racket @racket[subprocess] is an event that becomes ready on process exit.}
+          @item{The reader thread exits, due to an 'eof or due to an error. @racket{thread} is ready for synchronization in that case.}
+          @item{An explicit stop via @racket[catter-stop!].}]
+
+In all 3 cases, we want to do the same thing, so we compose @racket[choice-evt] and @racket[handle-evt]. This is pretty neat!
+
+Closing the subprocess input port is essential to cause the subprocess to quit. Then we wait for the process to quit and log an error if it did not exit successfully. At this point, any pending requests cannot be fulfilled. They get converted to @racket[Response-Attempt]s with an exception as the result. The next loop also discards all attempts to write to @code{proc-in} as those will no longer succeed. @bold{The most important action is to set @code{closed?} to @racket[#t]}.
+
+@chunk[<stop>
+       ; once the subproc is dead, some of these events will always be "ready".
+       ; avoid looping forever on them.
+       ; this is correct because this is the only case that sets closed? to true.
+       (if closed?
+           never-evt
+           (handle-evt (choice-evt cat-proc reader stop-ch)
+                       (lambda (_)
+                         (close-output-port proc-in)
+                         (subprocess-wait cat-proc)
+                         (define status (subprocess-status cat-proc))
+                         (when (not (zero? status))
+                           (log-git-cat-error "subprocess exited with non-zero exit code: ~a" status))
+                         (define new-puts
+                           (map
+                            (curryr pending->response (exn:fail "terminated" (current-continuation-marks)))
+                            pending))
+                         (loop null
+                               null
+                               (append new-puts response-attempts)
+                               #t))))]
+
+@subsection{Safely handling callers that have gone away}
+
+This is the first case where we are going to do something that will seem weird, but is surprisingly powerful. I'm also not sure if a facility like this truly exists in other concurrency implementations. We are going to handle the case where a caller submitted a request, but then disappeared before receiving the response. It either is no longer interested, or experienced some error and terminated. Regardless, we don't want to keep the request attempt pending on the manager end. We are going to leverage negative acknowledgement events here. See the TODO:Link section on the public API for how we acquired a nack event. On this end, what is important is that the nack event will become ready regardless of how the calling thread went away. We can use it to safely remove the pending request. Note that the catter will still submit the request to the subprocess. We are only using this to discard responses. We will see another appearance from nack events in the response-attempts handler TODO: Link section, where it will be more important.
+
+@margin-note{Removing any requests that are not yet sent to the subprocess from @code{write-requests} is left as an exercise for the reader ;-).}
+
+TODO: Contrast to Python and Go
+
+@chunk[<pending-requests>
+       (for/list ([req (in-list pending)])
+         (handle-evt (Pending-nack-evt req)
+                     (lambda (_)
+                       (loop (remq req pending)
+                             write-requests
+                             response-attempts
+                             closed?))))]
+
+@subsection{Submitting requests to the subprocess}
+
+@chunk[<submit-inputs>
+       (for/list ([req (in-list write-requests)])
+         (handle-evt (write-bytes-avail-evt req proc-in)
+                     (lambda (_)
+                       (loop pending (remq req write-requests) response-attempts closed?))))]
+
+One of the things to keep in mind when writing concurrent code is that we have to correctly handle any action that could cause the thread to block. Racket is communicating with the subprocess over pipes, and pipes have a limited capacity. The process on either end can block once this capacity is reached. If the subprocess is waiting for the reader thread to read from stdout, then it can block on stdin. This would be bad for the manager thread because it would not be able to service new incoming requests until that was resolved. Any and all actions in our loop should execute fast and re-enter the @racket[sync]. This is why, in TODO: Link the handling a new request section, we didn't try to write to the subprocess in the event handler. In this chunk of code, we use @racket[write-bytes-avail-evt] instead. This will only become ready if it is possible to write to the pipe immediately, without blocking. If so, it will perform the write. It offers the guarantee that if the event is not selected by @racket[sync], no bytes have been written. This ensures we don't write the same request multiple times. When this write succeeds, the handler removes it from future iterations.
+
+@subsection{Sending responses to the caller}
+
+@chunk[<response-attempts>
+       (for/list ([res (in-list response-attempts)])
+         (match-let ([(Response-Attempt ch nack-evt response) res])
+           (handle-evt (choice-evt (channel-put-evt ch response) nack-evt)
+                       (lambda (_)
+                         (loop pending
+                               write-requests
+                               (remq res response-attempts)
+                               closed?)))))]
+
+
+So far, we have been queuing reader responses into @code{response-attempts}, instead of resolving the caller's request. This is for the same reason that we aren't writing directly to the subprocess standard input. A @racket[channel] has no buffer, which means if the caller thread has gone away, a @racket[channel-put] will deadlock. Instead, we use @racket[channel-put-evt], which, similar to @racket[write-bytes-avail-evt] tries to perform the action in a way that does not block the @racket[sync], but only proceeds when it is possible to proceed. At the same time, this handler also monitors the nack event provided by the initial request. Due to how the public API will set this up, we are guaranteed that one of the two must succeed. Either the thread is still waiting on the other end, or the nack event will be ready. In either case, the handler simply removes the response attempt from future iterations. Pretty neat!
+
+@section{Implementing the public API}
+
+Phew! Good job on making it past the manager loop. There are still a couple of confusing things in there. Hopefully, seeing the public API will make clear those up.
 
 @chunk[<catter-stop-body>
        (thread-resume (catter-mgr a-catter) (current-thread))
        (channel-put (catter-stop-ch a-catter) 'stop)]
 
+Stopping the catter is pretty simple. Just issue a write (doesn't matter what we write) to the channel. However, the call to @racket[thread-resume] is key! Remember how the manager thread was created with @racket[thread/suspend-to-kill] so it doesn't terminate? Well, it can still be suspended if all custodians that were managing it go away. @racket[thread-resume] associates the manager thread with the current thread, which means it acquires all the custodian requirements of the current thread. With a non-empty custodian set, the thread can start running again. This is crucial because we are about to write to a channel that better have a reader on the other end. I encourage reading the kill-safety paper for the details.
+
+The other public APIs will similarly need to be careful to resume the thread!
+
 @chunk[<catter-read-body>
        (sync (catter-read-evt cat commit file-path))]
 
+The synchronous request version is easy. We take the async form and block on it.
+
 @chunk[<catter-read-evt-body>
-       ; in case the caller thread goes away, the nack-evt will become ready.
-       ; this allows the catter to remove callers no longer awaiting responses.
        (define evt (nack-guard-evt
                     (lambda (nack-evt)
-                      ; response will go here
                       (define resp-ch (make-channel))
-                      ; ensure the manager starts running with our custodian chain.
                       (thread-resume (catter-mgr cat) (current-thread))
-                      ; send the request.
                       (channel-put (catter-req-ch cat) (Request commit file-path resp-ch nack-evt))
                       resp-ch)))
        (handle-evt evt
-                   (lambda (resp)
-                     (if (exn:fail? resp)
-                         (raise resp)
-                         resp)))]
+                   <handle-read>)]
+
+This function provides the nack events the manager loop has been monitoring. nack events are a core part of the Racket/CML concurrency model, and are manufactured using @racket[nack-guard-evt]. I encourage reading the documentation for @racket[guard-evt] and @racket[nack-guard-evt] carefully, and playing with them a bit, as it isn't immediately obvious what is happening. Keep in mind that these functions, and @racket[handle-evt] are not immediately running any code. They are associating code to be run when events become ready, which can only happen at a @racket[sync]. So let's try to reason about this outside-in. @racket[catter-read-evt] is going to return a synchronizable event. This is the event obtained by calling
+
+@chunk[<handle-read>
+       (lambda (resp)
+         (if (exn:fail? resp)
+             (raise resp)
+             resp))]
+
+whenever the manager thread delivers a response. If that response was an exception, the exception is raised in this thread for ergonomics. Otherwise the file contents are returned.
+
+Now, to actually get a response back from the manager, we are using a @racket[channel]. However we want to guard against the API caller no longer waiting on the response. To do this, we manufacture a nack event with @racket[nack-guard-evt]. This accepts a function, to which the actual nack event is passed. There are now two events in play, and they are linked.
+
+The first event is the @emph{return value} of @racket[nack-guard-evt]. This event becomes ready when the return value of the function passed to @racket[nack-guard-evt] becomes ready. In this case, that is the channel on which the manager thread will deliver the response. This composes with the @racket[handle-evt].
+
+The second event is the @code{nack-evt} passed to the function. This event is sent to the manager. When (and only when!) the first event is used in a @racket[sync], but is @emph{not} chosen as the result of the @racket[sync], the nack event will become ready. If the first event @emph{is} chosen, then the nack event will @emph{never} become ready.
+
+
+@section{Additional thoughts}
+
+Readability of the long manager loop. Pattern of changing a couple of things, and leveraging immutability is nice. CML composition would allow splitting up into functions, but the need to keep the loop around renders this a little contrived.
+
+Cases in which thread-resume can still fail (if the manager threw an exception and terminated) and what to do about that.
+
+Bounded vs unbounded channels.
+
+@section{Scratch}
+
+
+
 
 @chunk[<*>
        (require racket/file)
@@ -338,14 +473,7 @@ We must also handle some error cases in the batch output. These can happen if th
 
        <catter-struct>
 
-       (struct Request (commit path ch nack-evt))
-       (struct Pending (key ch nack-evt))
-       (struct Response-Attempt (ch nack-evt resp))
-
-       (define (pending->response p resp)
-         (Response-Attempt (Pending-ch p)
-                           (Pending-nack-evt p)
-                           resp))
+       <useful-structs>
 
        <make-reader>
 
