@@ -423,6 +423,8 @@ The other public APIs will similarly need to be careful to resume the thread!
 
 The synchronous request version is easy. We take the async form and block on it.
 
+@subsection{Using negative acknowledgements to good effect}
+
 @chunk[<catter-read-evt-body>
        (define evt (nack-guard-evt
                     (lambda (nack-evt)
@@ -433,7 +435,13 @@ The synchronous request version is easy. We take the async form and block on it.
        (handle-evt evt
                    <handle-read>)]
 
-This function provides the nack events the manager loop has been monitoring. nack events are a core part of the Racket/CML concurrency model, and are manufactured using @racket[nack-guard-evt]. I encourage reading the documentation for @racket[guard-evt] and @racket[nack-guard-evt] carefully, and playing with them a bit, as it isn't immediately obvious what is happening. Keep in mind that these functions, and @racket[handle-evt] are not immediately running any code. They are associating code to be run when events become ready, which can only happen at a @racket[sync]. So let's try to reason about this outside-in. @racket[catter-read-evt] is going to return a synchronizable event. This is the event obtained by calling
+This function provides the nack events the manager loop has been monitoring. nack events are a core part of the Racket/CML concurrency model, and are manufactured using @racket[nack-guard-evt]. I encourage reading the documentation for @racket[guard-evt] and @racket[nack-guard-evt] carefully, and playing with them a bit, as it isn't immediately obvious what is happening. To get a response back from the manager, we are using a @racket[channel]. We want to guard against the API caller no longer waiting on the response. To do this, we wrap the channel with a nack event. The @racket[nack-guard-evt] function returns an event. Every time this event is used with @racket[sync], it calls the function passed to @racket[nack-guard-evt] with a new nack event. There are now two events in play, and they are linked.
+
+The first event is the @emph{return value} of @racket[nack-guard-evt]. This event becomes ready when the return value of the function passed to @racket[nack-guard-evt] becomes ready. In this case, that is the channel on which the manager thread will deliver the response.
+
+The second event is the @code{nack-evt} passed to the function. This event is sent to the manager. When (and only when!) the first event is used in a @racket[sync], but is @emph{not} chosen as the result of the @racket[sync], the nack event will become ready. If the first event @emph{is} chosen, then the nack event will @emph{never} become ready. This duality plays very nicely with the manager thread in TODO: link to sending responses to the caller.
+
+Finally, in true CML form, we can compose this existing composition with @racket[handle-evt] to raise an exception or deliver the result based on the response from the manager.
 
 @chunk[<handle-read>
        (lambda (resp)
@@ -441,27 +449,13 @@ This function provides the nack events the manager loop has been monitoring. nac
              (raise resp)
              resp))]
 
-whenever the manager thread delivers a response. If that response was an exception, the exception is raised in this thread for ergonomics. Otherwise the file contents are returned.
+Keep in mind that these functions, and @racket[handle-evt] are not immediately running any code. They are associating code to be run when events are passed to @racket[sync].
 
-Now, to actually get a response back from the manager, we are using a @racket[channel]. However we want to guard against the API caller no longer waiting on the response. To do this, we manufacture a nack event with @racket[nack-guard-evt]. This accepts a function, to which the actual nack event is passed. There are now two events in play, and they are linked.
+With that, we have completed the entire public API. I hope this gave you a taste of concurrency using Racket's CML primitives.
 
-The first event is the @emph{return value} of @racket[nack-guard-evt]. This event becomes ready when the return value of the function passed to @racket[nack-guard-evt] becomes ready. In this case, that is the channel on which the manager thread will deliver the response. This composes with the @racket[handle-evt].
+@section{Complete Code}
 
-The second event is the @code{nack-evt} passed to the function. This event is sent to the manager. When (and only when!) the first event is used in a @racket[sync], but is @emph{not} chosen as the result of the @racket[sync], the nack event will become ready. If the first event @emph{is} chosen, then the nack event will @emph{never} become ready.
-
-
-@section{Additional thoughts}
-
-Readability of the long manager loop. Pattern of changing a couple of things, and leveraging immutability is nice. CML composition would allow splitting up into functions, but the need to keep the loop around renders this a little contrived.
-
-Cases in which thread-resume can still fail (if the manager threw an exception and terminated) and what to do about that.
-
-Bounded vs unbounded channels.
-
-@section{Scratch}
-
-
-
+Some imports round off the program. Also see @hyperlink["https://github.com/nikhilm/git-catter/blob/master/main.rkt"]{the full listing}. 
 
 @chunk[<*>
        (require racket/file)
@@ -489,3 +483,15 @@ Bounded vs unbounded channels.
 
        <example>]
 
+@section{References and acknowledgements}
+
+
+@section{Additional thoughts}
+
+Readability of the long manager loop. Pattern of changing a couple of things, and leveraging immutability is nice. CML composition would allow splitting up into functions, but the need to keep the loop around renders this a little contrived.
+
+Cases in which thread-resume can still fail (if the manager threw an exception and terminated) and what to do about that.
+
+Bounded vs unbounded channels.
+
+Comparison to Erlang, Python, Go.
