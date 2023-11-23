@@ -1,20 +1,27 @@
 #lang scribble/lp2/manual
-@require[@for-label[racket/base]]
+@require[@for-label[racket/base
+                    racket/match
+                    racket/file
+                    racket/function
+                    racket/string
+                    racket/async-channel]]
 
 @title{A practical example of kill-safe, concurrent programming in Racket}
 @author[(author+email "Nikhil Marathe" "me@nikhilism.com" #:obfuscate? #t)]
 
-@hyperlink["https://racket-lang.org"]{Racket's} default concurrency model is based on green threads. It uses a model based on ConcurrentML (CML), which is very similar to Go, but allows further composition of concurrency primitives. In @hyperlink["https://nikhilism.com/post/2023/racket-beyond-languages/#concurrentml-inspired-concurrency"]{one of my posts} I had given a quick summary of this and pointers to other resources. I thought it would be good to walk through building a somewhat useful concurrent program to show how to use it. As an experiment, this is written as a literate program, using @hyperlink["https://docs.racket-lang.org/scribble-lp2-manual/index.html"]{scribble/lp2/manual}
+@hyperlink["https://racket-lang.org"]{Racket's} default concurrency model is based on green threads. It uses a model based on ConcurrentML (CML), which is very similar to Go, but allows further composition of concurrency primitives. In @hyperlink["https://nikhilism.com/post/2023/racket-beyond-languages/#concurrentml-inspired-concurrency"]{one of my posts} I had given a quick summary of this and pointers to other resources. I thought it would be good to walk through building a somewhat useful concurrent program to show how to use it. As an experiment, this is written as a literate program, using @hyperlink["https://docs.racket-lang.org/scribble-lp2-manual/index.html"]{scribble/lp2/manual}.
 
 Beyond the use of ConcurrentML primitives, which allow dynamically building up sets of events to wait on, and associating actions to run when those events are @emph{selected}, this program also demonstrates @hyperlink["https://users.cs.utah.edu/plt/publications/pldi04-ff.pdf"]{kill-safety}. That is, the program should exhibit liveness and safety in the presence of subprocess exits, or various other threads terminating.
 
 This tutorial assumes some familiarity with Racket, Go-style concurrency (including @hyperlink["https://gobyexample.com/channels"]{channels}), green threads, Git and running subprocesses.
 
-The use case is to provide a Racket wrapper for @hyperlink["https://git-scm.com/docs/git-cat-file"]{git-cat-file}. Imagine a task that requires getting the contents of a specific file in a Git repository at a specific commit. A common uses case includes generating some code from the contents at a specific commit.
+The use case is to provide a Racket wrapper for @hyperlink["https://git-scm.com/docs/git-cat-file"]{git-cat-file}. Imagine a task that requires getting the contents of a specific file in a Git repository at a specific commit. A common uses case includes generating some code from the contents at a specific commit. We would like to allow concurrent requests for file contents and correctly serve responses to calling threads.
 
-To avoid subprocess overhead the program will use @code{cat-file}'s @emph{batch mode}. This batch execution will be wrapped in a @racket[catter], and multiple threads can concurrently request the contents of files at various commits.
+To avoid subprocess overhead the program will use @code{cat-file}'s @emph{batch mode}. This batch execution will be wrapped in a @racket[catter] which will be usable by multiple threads.
 
-@section{The catter API}
+@margin-note{Racket threads are a unit of concurrency and isolation, not @emph{parallelism}. See @hyperlink["https://docs.racket-lang.org/guide/parallelism.html#%28part._effective-places%29"]{Places} for a parallelism mechanism that could be easily integrated into this code.}
+
+@section[#:tag "api-intro"]{The catter API}
 
 A user creates a catter using @racket[make-catter]. The returned catter can be safely used from multiple threads.
 
@@ -22,7 +29,7 @@ A user creates a catter using @racket[make-catter]. The returned catter can be s
        (define (make-catter repo-path)
          <make-catter-body>)]
 
-The catter can be stopped via custodian shutdown, or using @racket[catter-stop!].
+The catter can be stopped via @hyperlink["https://docs.racket-lang.org/reference/eval-model.html#%28tech._custodian%29"]{custodian shutdown}, or using @racket[catter-stop!].
 
 @chunk[<catter-stop>
        (define (catter-stop! a-catter)
@@ -42,7 +49,7 @@ and @racket[catter-read-evt]
 
 which offers a @emph{synchronizable event} that can be waited on with other events. This will become @emph{ready for synchronization} when the file content is available, and the @emph{synchronization result} is the file contents. For example, the consumer could @racket[sync] on this with a @racket[alarm-evt] to do something else if a response is not received within a given time.
 
-Here is a complete example of using @racket[catter]. TODO: Use a different repo. It hard-codes a few different files, and gets their content at a specific commit, but in different threads.
+Here is a complete example of using @racket[catter]. It hard-codes a few different files, and gets their content at a specific commit, but in different threads.
 
 @chunk[<example>
        (define (do-stuff-with-file file-path contents)
@@ -50,16 +57,14 @@ Here is a complete example of using @racket[catter]. TODO: Use a different repo.
 
        (define files
          (list
-          "content/post/2023/canadian-express-entry-experience.md"
-          "content/post/2023/gossip-glomers-racket.md"
-          "content/post/2023/gradient-descent-racket.m"
-          "content/post/2023/making-sense-of-continuations.md"
-          "content/post/2023/nuphy-air75-wireless-linux.md"
-          ))
+          "info.rkt"
+          "main.rkt"
+          "does-not-exist"))
 
-       (define commit "688600a4be5f016acfbf6c191562913b490ed687")
+       (define commit "master")
 
-       (define cat (make-catter "/home/nikhil/nikhilism.com"))
+       (code:comment @{Uses the repository of this tutorial.})
+       (define cat (make-catter (current-directory)))
        (define tasks 
          (for/list ([file files])
            (thread
@@ -68,15 +73,17 @@ Here is a complete example of using @racket[catter]. TODO: Use a different repo.
        (map sync tasks)
        (catter-stop! cat)]
 
-@section{Design}
+@section[#:tag "design"]{Design}
 
 The @racket[catter] manages a @code{git-cat-file} @racket[subprocess]. Requests for file contents need to be written to the stdin of the subprocess, and responses are read from stdout. Responses have a specific pattern: a single line with response metadata, a new line, then the contents, then a new line. To avoid having to juggle this state of where we are, we will have a dedicated @deftech{reader thread} to read stdout. Just like @emph{goroutines}, Racket @racket[thread]s are very cheap to create and are pre-emptible.
 
-Besides managing the subprocess, the @racket[catter] has to handle incoming requests, and deliver responses to the correct calling thread. The implementation will make liberal use of @racket[channel]s for this, as these are also cheap to create. Channels are always synchronous (like CML). They don't @emph{contain} values. Rather, they act as emph{synchronization points} where threads can @emph{rendezvous} and exchange a single value. If you really need bounded, buffered channels, those are present in the standard library.
+Besides managing the subprocess, the @racket[catter] has to handle incoming requests, and deliver responses to the correct calling thread. The implementation will make liberal use of @racket[channel]s for this, as these are also cheap to create. Channels are always synchronous (like CML). They don't @emph{contain} values. Rather, they act as @emph{synchronization points} where threads can @emph{rendezvous} and exchange a single value.
 
-To perform all this management, the @racket[catter] has a @deftech{manager thread} that spins forever. The @tech{manager thread} is the heart of @racket[catter], and exhibits the kill safety characteristics we want.
+@margin-note{Bounded, buffered channels are present in the standard library. See @racket[make-async-channel].}
 
-@section{Creating the catter}
+To perform all this management, the @racket[catter] has a @deftech{manager thread} that spins forever. The manager thread is the heart of @racket[catter], and exhibits the kill safety characteristics we want.
+
+@section[#:tag "create"]{Creating the catter}
 
 To help debug the code, lets define a helper logger
 
@@ -90,7 +97,7 @@ This defines a logger named @code{git-cat}, and several helper functions like:
 
 Both the Dr. Racket Log window and the terminal will show log output based on the log level. This can be set to @code{debug} by setting the environment variable @code|{PLTSTDERR="debug@git-cat"}|, or making a similar change in the Dr. Racket Log window.
 
-@racket[catter] is a struct. @code{req-ch} is a @racket[channel] for incoming requests. @code{stop-ch} is a channel to tell the catter to stop (only used by @racket[catter-stop!]) and @code{mgr} is the @tech{manager thread}.
+@racket[catter] is a @racket[struct]. @code{req-ch} is a @racket[channel] for incoming requests. @code{stop-ch} is a channel to tell the catter to stop (only used by @racket[catter-stop!]) and @code{mgr} is the @tech{manager thread}.
 
 @chunk[<catter-struct>
        (struct catter (req-ch stop-ch mgr))]
@@ -127,7 +134,9 @@ The use of @racket[thread/suspend-to-kill] is crucial. Unlike a thread created w
 
 a naive implementation would lead to the second thread never receiving a response, as @racket[catter-read] would submit a request, but the manager thread would be dead. A suspended thread will only truly terminate when there are no references to it any longer.
 
-@subsection{Creating the subprocess}
+@subsection[#:tag "create-subproc"]{Creating the subprocess}
+
+As soon as the catter is created, the manager thread creates the @code{git-cat-file} subprocess.
 
 @chunk[<subproc-creation>
        (define-values (cat-proc proc-out proc-in _)
@@ -147,11 +156,12 @@ a naive implementation would lead to the second thread never receiving a respons
        
        (file-stream-buffer-mode proc-in 'line)]
 
-This part is fairly easy. I won't explain the work-around for Dr. Racket. We use @racket[subprocess] to spawn @code{git cat-file}, passing a few parameters. The crucial one is the @code{--batch=} format string. The @code{%(rest)} bit request's that anything in the input request following the object name is reflected back in the response. This allows delivering file contents to the correct read request. The parameterization of @racket[current-subprocess-custodian-mode] ensures the process is forcibly killed on custodian shutdown. This does mean that if any thread creates the @racket[catter] within a custodian and shuts down the custodian, any threads spawned outside the custodian, that use the catter, will receive a non-functional catter. However our kill-safe design will still make sure those threads don't block. Finally, we set the stdin mode to line buffered. This way the port implementation will automatically flush when we write a line, saving us some effort.
+This part is fairly straightforward, beyond the workaround for Dr. Racket. We use @racket[subprocess] to spawn @code{git cat-file}, passing a few parameters. The crucial one is the @code{--batch=} format string. The @code{%(rest)} bit request's that anything in the input request following the object name is reflected back in the response. This allows delivering file contents to the correct read request. The parameterization of @racket[current-subprocess-custodian-mode] ensures the process is forcibly killed on custodian shutdown. This does mean that if any thread creates the @racket[catter] within a custodian and shuts down the custodian, any threads spawned outside the custodian, that use the catter, will receive a non-functional catter. However our kill-safe design will still make sure those threads don't block. Finally, we set the stdin mode to line buffered. This way the port implementation will automatically flush when we write a line, saving us some effort.
 
-@subsection{Reader setup}
+@subsection[#:tag "reader-setup"]{Reader setup}
 
-This is pretty simple, with the actual details in the relevant section (TODO: Link).
+This is pretty simple, with the actual details in the @secref{reader}.
+
 @chunk[<reader-setup>
        (define reader-resp-ch (make-channel))
        (define reader (make-reader proc-out reader-resp-ch))]
@@ -160,7 +170,7 @@ The @code{reader-resp-ch} channel is used to read responses from the reader thre
 
 Let's digress to the reader thread for a bit, before diving into the meat of the implementation.
 
-@section{The Reader}
+@section[#:tag "reader"]{The Reader Thread}
 
 The reader is a regular thread, since kill-safety doesn't require it to stay suspended. It will read @code{git-cat-file} batch output and put a response on the @code{resp-ch}. We @racket[parameterize] the input port so that all read operations can default to the @racket[current-input-port] instead of requiring @code{proc-out} to be passed to each one.
 
@@ -168,7 +178,6 @@ The reader is a regular thread, since kill-safety doesn't require it to stay sus
        (define (make-reader proc-out resp-ch)
          (thread
           (lambda ()
-            ; TODO: Can the key have whitespace?
             (parameterize ([current-input-port proc-out])
               <reader-loop>))))]
 
@@ -183,26 +192,25 @@ The reader loop is fairly straightforward.
               (define object-len (string->number object-len-s))
               (define contents (read-bytes object-len))
               (if (= (bytes-length contents) object-len)
-                  ; consume the newline
                   (begin
+                    (code:comment @{consume the newline})
                     (read-char)
                     (channel-put resp-ch (cons key contents))
                     (loop))
-                  ; subproc must've exited/catter stopped.
+                  (code:comment @{The subprocess must have exited})
                   (error 'unexpected-eof))]
-             ; (or ...) doesn't allow introducing sub-patterns to match against, so use regexp.
              <error-handling>)))]
 
-It tries to read one line, which is assumed to be the metadata line. This is split by whitespace and matched to the @code{"blob"} output. This indicates we got successful file contents, in which case we can use @racket[match]'s powerful ability to introduce bindings to access the various metadata. We do make sure to read exactly the file contents. If we are unable to do this, something is wrong (the subprocess exited), and we error. Otherwise the key and contents are written out to the channel.
+It tries to read one line, which is assumed to be the metadata line. This is split by whitespace and matched to the @code{"blob"} output. This indicates we got successful file contents, in which case we can use @racket[match]'s powerful ability to introduce bindings to access the various metadata. We do make sure to read exactly the file contents. If we are unable to do this, something is wrong (the subprocess exited), and we error. Otherwise the key and contents are written out to the channel. The reader enters the next iteration of the loop to read additional output.
 
 We must also handle some error cases in the batch output. These can happen if the input commit/file-path combination was invalid. Unlike end-of-file, these are user errors and should be relayed to the caller. So we match those forms, and then create an @racket[exn:fail] object with some extra information. That is written out to the channel, with other parts of the API knowing how to handle exceptions.
 
 While @racket[match] provides an @code{or} matcher, it doesn't allow binding the match to an identifier. We need the message so we can tell the caller what happened, so we use a @racket[regexp] matcher.
 
 @chunk[<error-handling>
+       (code:comment @{(or ...) doesn't allow introducing sub-patterns to match against, so use regexp.})
        [(list object-name (regexp #rx"^missing|ambiguous$" msg))
         (channel-put resp-ch
-                     ; In case of missing, the returned object-name is what we passed in, so it can be used as the key.
                      (cons object-name
                            (exn:fail
                             (format "~a object ~v" (car msg) object-name)
@@ -211,18 +219,11 @@ While @racket[match] provides an @code{or} matcher, it doesn't allow binding the
 
 All other exceptions will cause the reader to fail, and the manager will observe that.
 
-@section{The Manager}
+@section[#:tag "manager"]{The Manager}
 
-This is the crux of the program. We are going to continue from where we left off in @code{<make-manager>}. We will observe several useful features of the CML model here.
+This is the crux of the program. We are going to continue from where we left off in @code{<make-manager>}. We will observe several useful features of the CML concurrency model here.
 
-The main standout is @racket[sync], which blocks on an entire sequence of events, and proceeds
-when @emph{exactly one of them} is ready for synchronization. TODO: Link to andy wingo explanation of how this is done. Unlike Go's @code{select} statement, the sequence can be built up dynamically.
-
-The other is useful primitives like @racket[handle-evt] that allow us to associate behaviors with events, while preserving composition.
-
-@margin-note{Technically, Go has @hyperlink["https://pkg.go.dev/reflect#Select"]{reflect.Select()} which allows a list of cases, but I don't think it is widely used in practice.}
-
-@subsection{The Manager Loop}
+@subsection[#:tag "manager-loop"]{The Manager Loop}
 
 The manager is an infinite loop that maintains 3 lists and a boolean.
 
@@ -272,7 +273,7 @@ We use @racket[apply] plus @racket[append] to assemble the various combinations 
 
 To restate, each iteration of the loop, @racket[sync] will pick @emph{one} event out of any that are ready for synchronization. It will return the synchronization result of that event. Our events are actually wrapper events returned by @racket[handle-evt]. This means, when the wrapped event is ready for synchronization, the wrapper is also ready. However, the synchronization result of the event from @racket[handle-evt] is the return value of the function provided as the second argument of @racket[handle-evt]. Due to Racket's tail call optimizations, it is safe and fast for these functions to call @code{loop} as long as it is done in tail position.
 
-@subsection{Handling a new request}
+@subsection[#:tag "new-req"]{Handling a new request}
 
 @chunk[<new-request>
        (handle-evt req-ch
@@ -300,9 +301,7 @@ If the catter is already closed, we don't create a pending request. Instead we q
 
 In the common case where the catter is running, we create a key using the commit and path. We do this because the object name of the response will not be the commit+file path, so we need a way to associate the request and response. The key is also the input request object name. We rely on @code{cat-file}'s input syntax treating everything after the object name as something that will be echoed back in the @code{%(rest)} output format. We loop with this request line ready to be written.
 
-@margin-note{TODO: Note about how key is not strictly required.}
-
-@subsection{Handling responses from the Reader}
+@subsection[#:tag "reader-response"]{Handling responses from the Reader}
 
 The next possible event is the reader responding with a @racket[pair] of the key and contents. Handling it is straightforward. This handler tries to find an entry in pending that matches the key. It creates a @racket[Response-Attempt] from that, and then removes it from the pending list (by returning @racket[#f] to the @racket[filter]). It loops again with the two modified lists.
 
@@ -329,7 +328,7 @@ The next possible event is the reader responding with a @racket[pair] of the key
                                 response-attempts)
                             closed?)]))]
 
-@subsection{Events that stop the catter}
+@subsection[#:tag "stop-events"]{Events that stop the catter}
 
 There are 3 situations in which the catter can no longer process new requests.
 
@@ -364,13 +363,11 @@ Closing the subprocess input port is essential to cause the subprocess to quit. 
                                (append new-puts response-attempts)
                                #t))))]
 
-@subsection{Safely handling callers that have gone away}
+@subsection[#:tag "kill-safe"]{Safely handling callers that have gone away}
 
-This is the first case where we are going to do something that will seem weird, but is surprisingly powerful. I'm also not sure if a facility like this truly exists in other concurrency implementations. We are going to handle the case where a caller submitted a request, but then disappeared before receiving the response. It either is no longer interested, or experienced some error and terminated. Regardless, we don't want to keep the request attempt pending on the manager end. We are going to leverage negative acknowledgement events here. See the TODO:Link section on the public API for how we acquired a nack event. On this end, what is important is that the nack event will become ready regardless of how the calling thread went away. We can use it to safely remove the pending request. Note that the catter will still submit the request to the subprocess. We are only using this to discard responses. We will see another appearance from nack events in the response-attempts handler TODO: Link section, where it will be more important.
+This is the first case where we are going to do something that will seem weird, but is surprisingly powerful. I'm also not sure if a facility like this truly exists in other concurrency implementations. We are going to handle the case where a caller submitted a request, but then disappeared before receiving the response. It either is no longer interested, or experienced some error and terminated. Regardless, we don't want to keep the request attempt pending on the manager end. We are going to leverage negative acknowledgement events here. See the @secref{nacks} for how we acquired a nack event. On this end, what is important is that the nack event will become ready regardless of how the calling thread went away. We can use it to safely remove the pending request. Note that the catter will still submit the request to the subprocess. We are only using this to discard responses. We will see another appearance from nack events in the @seclink["respond-caller"]{response-attempts handler}, where it will be more important.
 
 @margin-note{Removing any requests that are not yet sent to the subprocess from @code{write-requests} is left as an exercise for the reader ;-).}
-
-TODO: Contrast to Python and Go
 
 @chunk[<pending-requests>
        (for/list ([req (in-list pending)])
@@ -381,7 +378,7 @@ TODO: Contrast to Python and Go
                              response-attempts
                              closed?))))]
 
-@subsection{Submitting requests to the subprocess}
+@subsection[#:tag "req-submission"]{Submitting requests to the subprocess}
 
 @chunk[<submit-inputs>
        (for/list ([req (in-list write-requests)])
@@ -389,9 +386,11 @@ TODO: Contrast to Python and Go
                      (lambda (_)
                        (loop pending (remq req write-requests) response-attempts closed?))))]
 
-One of the things to keep in mind when writing concurrent code is that we have to correctly handle any action that could cause the thread to block. Racket is communicating with the subprocess over pipes, and pipes have a limited capacity. The process on either end can block once this capacity is reached. If the subprocess is waiting for the reader thread to read from stdout, then it can block on stdin. This would be bad for the manager thread because it would not be able to service new incoming requests until that was resolved. Any and all actions in our loop should execute fast and re-enter the @racket[sync]. This is why, in TODO: Link the handling a new request section, we didn't try to write to the subprocess in the event handler. In this chunk of code, we use @racket[write-bytes-avail-evt] instead. This will only become ready if it is possible to write to the pipe immediately, without blocking. If so, it will perform the write. It offers the guarantee that if the event is not selected by @racket[sync], no bytes have been written. This ensures we don't write the same request multiple times. When this write succeeds, the handler removes it from future iterations.
+One of the things to keep in mind when writing concurrent code is that we have to avoid any action that could cause the thread to block. Racket is communicating with the subprocess over pipes, and pipes have a limited capacity. The process on either end can block once this capacity is reached. If the subprocess is waiting for the reader thread to read from stdout, then it can block on stdin. This would be bad for the manager thread because it would not be able to service new incoming requests until that was resolved. Any and all actions in our loop should execute without blocking and re-enter the @racket[sync]. This is why, in @secref{new-req}, we didn't try to write to the subprocess in the event handler. In this chunk of code, we use @racket[write-bytes-avail-evt] instead. This will only become ready if it is possible to write to the pipe immediately, without blocking. If so, it will perform the write. It offers the guarantee that if the event is not selected by @racket[sync], no bytes have been written. This ensures we don't write the same request multiple times. When this write succeeds, the handler removes it from future iterations.
 
-@subsection{Sending responses to the caller}
+@margin-note{The use of events to write to the process stdin means that requests may be submitted to the subprocess out of order from how they were received by the manager thread. This makes the @code{key} crucial to match callers. However it is safe to have multiple requests for the same key and resolve them in any order.}
+
+@subsection[#:tag "respond-caller"]{Sending responses to the caller}
 
 @chunk[<response-attempts>
        (for/list ([res (in-list response-attempts)])
@@ -406,15 +405,15 @@ One of the things to keep in mind when writing concurrent code is that we have t
 
 So far, we have been queuing reader responses into @code{response-attempts}, instead of resolving the caller's request. This is for the same reason that we aren't writing directly to the subprocess standard input. A @racket[channel] has no buffer, which means if the caller thread has gone away, a @racket[channel-put] will deadlock. Instead, we use @racket[channel-put-evt], which, similar to @racket[write-bytes-avail-evt] tries to perform the action in a way that does not block the @racket[sync], but only proceeds when it is possible to proceed. At the same time, this handler also monitors the nack event provided by the initial request. Due to how the public API will set this up, we are guaranteed that one of the two must succeed. Either the thread is still waiting on the other end, or the nack event will be ready. In either case, the handler simply removes the response attempt from future iterations. Pretty neat!
 
-@section{Implementing the public API}
+@section[#:tag "api-impl"]{Sending requests and receiving responses}
 
-Phew! Good job on making it past the manager loop. There are still a couple of confusing things in there. Hopefully, seeing the public API will make clear those up.
+Phew! Good job on making it past the manager loop. There are still a couple of confusing things in there. Hopefully, seeing the public API will clear those up. See @secref{api-intro} for the declarations.
 
 @chunk[<catter-stop-body>
        (thread-resume (catter-mgr a-catter) (current-thread))
        (channel-put (catter-stop-ch a-catter) 'stop)]
 
-Stopping the catter is pretty simple. Just issue a write (doesn't matter what we write) to the channel. However, the call to @racket[thread-resume] is key! Remember how the manager thread was created with @racket[thread/suspend-to-kill] so it doesn't terminate? Well, it can still be suspended if all custodians that were managing it go away. @racket[thread-resume] associates the manager thread with the current thread, which means it acquires all the custodian requirements of the current thread. With a non-empty custodian set, the thread can start running again. This is crucial because we are about to write to a channel that better have a reader on the other end. I encourage reading the kill-safety paper for the details.
+Stopping the catter is pretty simple. Just issue a write (doesn't matter what we write) to the channel. However, the call to @racket[thread-resume] is key! Remember how the manager thread was created with @racket[thread/suspend-to-kill] so it doesn't terminate? Well, it can still be suspended if all custodians that were managing it go away. @racket[thread-resume] associates the manager thread with the current thread, which means it acquires all the custodian requirements of the current thread. With a non-empty custodian set, the thread can start running again. This is crucial because we are about to write to a channel that better have a reader on the other end. I encourage reading the @seclink["references"]{kill-safety paper} for the details.
 
 The other public APIs will similarly need to be careful to resume the thread!
 
@@ -423,7 +422,7 @@ The other public APIs will similarly need to be careful to resume the thread!
 
 The synchronous request version is easy. We take the async form and block on it.
 
-@subsection{Using negative acknowledgements to good effect}
+@subsection[#:tag "nacks"]{Using negative acknowledgements to good effect}
 
 @chunk[<catter-read-evt-body>
        (define evt (nack-guard-evt
@@ -439,7 +438,7 @@ This function provides the nack events the manager loop has been monitoring. nac
 
 The first event is the @emph{return value} of @racket[nack-guard-evt]. This event becomes ready when the return value of the function passed to @racket[nack-guard-evt] becomes ready. In this case, that is the channel on which the manager thread will deliver the response.
 
-The second event is the @code{nack-evt} passed to the function. This event is sent to the manager. When (and only when!) the first event is used in a @racket[sync], but is @emph{not} chosen as the result of the @racket[sync], the nack event will become ready. If the first event @emph{is} chosen, then the nack event will @emph{never} become ready. This duality plays very nicely with the manager thread in TODO: link to sending responses to the caller.
+The second event is the @code{nack-evt} passed to the function. This event is sent to the manager. When (and only when!) the first event is used in a @racket[sync], but is @emph{not} chosen as the result of the @racket[sync], the nack event will become ready. If the first event @emph{is} chosen, then the nack event will @emph{never} become ready. This duality plays very nicely with the manager thread in @secref{respond-caller}.
 
 Finally, in true CML form, we can compose this existing composition with @racket[handle-evt] to raise an exception or deliver the result based on the response from the manager.
 
@@ -453,7 +452,7 @@ Keep in mind that these functions, and @racket[handle-evt] are not immediately r
 
 With that, we have completed the entire public API. I hope this gave you a taste of concurrency using Racket's CML primitives.
 
-@section{Complete Code}
+@section[#:tag "complete-code"]{Complete Code}
 
 Some imports round off the program. Also see @hyperlink["https://github.com/nikhilm/git-catter/blob/master/main.rkt"]{the full listing}. 
 
@@ -483,10 +482,17 @@ Some imports round off the program. Also see @hyperlink["https://github.com/nikh
 
        <example>]
 
-@section{References and acknowledgements}
+@section[#:tag "references"]{References and acknowledgements}
 
+@hyperlink["https://docs.racket-lang.org"]{The Racket Docs} are an excellent source of reference information for @hyperlink["https://docs.racket-lang.org/reference/sync.html"]{events}, @hyperlink["https://docs.racket-lang.org/reference/eval-model.html#%28tech._thread%29"]{threads}, and all the other possible standard library items that can act as events. Racket also provides ways for user @racket[struct]s to @hyperlink["https://docs.racket-lang.org/reference/sync.html#%28def._%28%28quote._~23~25kernel%29._prop~3aevt%29%29"]{act as events}, and the unsafe FFI APIs allow arbitrary @hyperlink["https://docs.racket-lang.org/foreign/Thread_Scheduling.html#%28def._%28%28lib._ffi%2Funsafe%2Fschedule..rkt%29._unsafe-poll-ctx-fd-wakeup%29%29"]{file descriptors} and other polling mechanisms to plug into this system.
 
-@section{Additional thoughts}
+Flatt and Findler's @hyperlink["https://users.cs.utah.edu/plt/publications/pldi04-ff.pdf"]{Kill-Safe Synchronization Abstractions}, while 20 years old at this point, is a really good reference to the implementation of CML in Racket, and the problems they set out to solve. It is also an excellent example of @hyperlink["https://felleisen.org/matthias/manifesto/sec_intern.html"]{Racket internalizing extra-linguistic mechanisms}.
+
+@hyperlink["https://wingolog.org"]{Andy Wingo's} @hyperlink["https://wingolog.org/archives/2017/06/29/a-new-concurrent-ml"]{A New Concurrent ML} is a really good introduction to the nitty gritty implementation details of CML. As are his @hyperlink["https://wingolog.org/archives/2016/09/20/concurrent-ml-versus-go"]{related} @hyperlink["https://wingolog.org/archives/2016/09/21/is-go-an-acceptable-cml"]{posts} comparing it to Go.
+
+@hyperlink["https://defn.io"]{Bogdan Popa's} @hyperlink["https://github.com/Bogdanp/racket-resource-pool/blob/master/resource-pool-lib/pool.rkt"]{resource-pool-lib} is another good application of CML that I consulted heavily while wrapping my head around this model.
+
+@section[#:tag "thoughts"]{Additional thoughts}
 
 Readability of the long manager loop. Pattern of changing a couple of things, and leveraging immutability is nice. CML composition would allow splitting up into functions, but the need to keep the loop around renders this a little contrived.
 
@@ -495,3 +501,5 @@ Cases in which thread-resume can still fail (if the manager threw an exception a
 Bounded vs unbounded channels.
 
 Comparison to Erlang, Python, Go.
+
+What about parallelism?
