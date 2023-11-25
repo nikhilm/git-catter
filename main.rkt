@@ -155,11 +155,6 @@
                                response-attempts
                                closed?))))
          
-         (for/list ([req (in-list write-requests)])
-           (handle-evt (write-bytes-avail-evt req proc-in)
-                       (lambda (_)
-                         (loop pending (remq req write-requests) response-attempts closed?))))
-         
          (for/list ([res (in-list response-attempts)])
            (match-let ([(Response-Attempt ch nack-evt response) res])
              (handle-evt (choice-evt (channel-put-evt ch response) nack-evt)
@@ -167,7 +162,13 @@
                            (loop pending
                                  write-requests
                                  (remq res response-attempts)
-                                 closed?)))))))))))
+                                 closed?)))))
+         
+         (for/list ([req (in-list write-requests)])
+           (handle-evt (write-bytes-avail-evt req proc-in)
+                       (lambda (_)
+                         (loop pending (remq req write-requests) response-attempts closed?))))
+         ))))))
 
 (define (make-catter repo-path)
   (define req-ch (make-channel))
