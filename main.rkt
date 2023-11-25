@@ -44,13 +44,12 @@
                     (loop))
                   ; subproc must've exited/catter stopped.
                   (error 'unexpected-eof))]
-             ; (or ...) doesn't allow introducing sub-patterns to match against, so use regexp.
-             [(list object-name (regexp #rx"^missing|ambiguous$" msg))
+             [(list object-name (and msg (or "ambiguous" "missing")))
               (channel-put resp-ch
                            ; In case of missing, the returned object-name is what we passed in, so it can be used as the key.
                            (cons object-name
                                  (exn:fail
-                                  (format "~a object ~v" (car msg) object-name)
+                                  (format "~a object ~v" msg object-name)
                                   (current-continuation-marks))))
               (loop)])))))))
 

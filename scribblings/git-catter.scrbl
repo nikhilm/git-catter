@@ -206,18 +206,17 @@ The reader loop is fairly straightforward.
 It tries to read one line, which is assumed to be the metadata line. This is split by whitespace and matched to the @code{"blob"} output. This indicates we got successful file contents, in which case we can use @racket[match]'s powerful ability to introduce bindings to access the various metadata. We do make sure to read exactly the file contents. If we are unable to do this, something is wrong (the subprocess exited), and we error. Otherwise the key and contents are written out to the channel as a cons pair. The reader enters the next iteration of the loop to read additional output.
 
 @chunk[<error-handling>
-       (code:comment @{(or ...) doesn't allow introducing sub-patterns to match against, so use regexp.})
-       [(list object-name (regexp #rx"^missing|ambiguous$" msg))
+       [(list object-name (and msg (or "ambiguous" "missing")))
         (channel-put resp-ch
                      (cons object-name
                            (exn:fail
-                            (format "~a object ~v" (car msg) object-name)
+                            (format "~a object ~v" msg object-name)
                             (current-continuation-marks))))
         (loop)]]
 
 We must also handle some error cases in the batch output. These can happen if the input commit/file-path combination was invalid. Unlike end-of-file, these are user errors and should be relayed to the caller. So we match those forms, and then create an @racket[exn:fail] object with some extra information. That is written out to the channel, with other parts of the API knowing how to handle exceptions.
 
-While @racket[match] provides an @code{or} matcher, it doesn't allow binding the match to an identifier. We need the message so we can tell the caller what happened, so we use a @racket[regexp] matcher.
+The @code{(and ...)} matcher has a neat trick where an identifier can be used as the first argument to bind the matched pattern to it.
 
 All other exceptions will cause the reader to fail and exit, and the manager will observe that.
 
@@ -519,4 +518,6 @@ Flatt and Findler's @hyperlink["https://users.cs.utah.edu/plt/publications/pldi0
 @hyperlink["https://defn.io"]{Bogdan Popa's} @hyperlink["https://github.com/Bogdanp/racket-resource-pool/blob/master/resource-pool-lib/pool.rkt"]{resource-pool-lib} is another good application of CML patterns in Racket that I consulted heavily while wrapping my head around this model.
 
 John Reppy is the creator of Concurrent ML. He has several papers laying out its design and specifics. I read @hyperlink["https://www.cs.tufts.edu/~nr/cs257/archive/john-reppy/cml-pldi.pdf"]{CML: A Higher-order Concurrent Language} and thought it was a good primer on CML, although the APIs are very different compared to their Racket forms.
+
+Finally, thanks to EmEf and benknoble on the Racket forums for @hyperlink["https://racket.discourse.group/t/feedback-help-requested-a-practical-introduction-to-kill-safe-concurrent-programming-in-racket/2534"]{helping me} with a few things.
 
