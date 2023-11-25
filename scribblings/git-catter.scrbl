@@ -494,12 +494,12 @@ Flatt and Findler's @hyperlink["https://users.cs.utah.edu/plt/publications/pldi0
 
 @section[#:tag "thoughts"]{Additional thoughts}
 
-Readability of the long manager loop. Pattern of changing a couple of things, and leveraging immutability is nice. CML composition would allow splitting up into functions, but the need to keep the loop around renders this a little contrived.
+There are a lot of things I like about this concurrency model.
 
-Cases in which thread-resume can still fail (if the manager threw an exception and terminated) and what to do about that.
+Composition is a powerful way to perform subsequent handling on concurrent operations. The green threading + pre-emption means there is no function coloring problem. The kill-safety and liveness properties are pretty nice.
+I don't have enough experience to say how negative acknowledgement events compare to other cancellation mechanisms like cancellation tokens or Python's cancellation exception. One of the advantages I realize is that with a specific value to watch for, it is harder to mess up cancellation handling for others. In Python, a task has to handle CancelledError, and if it swallows it, it can mess up calling code as well. I am also not aware of any mechanism in Python to know if another thread exits in error. The async/await model also has no guarantees on only one event out of a multitude of them getting chosen. For example, a primitive like @racket[read-line-evt] guarantees that data has been read from the buffer only if the event was selected. On the contrary, using @code{asyncio.wait()} in Python makes no such guarantees.
 
-Bounded vs unbounded channels.
+This code does not handle @hyperlink["https://docs.racket-lang.org/reference/breakhandler.html"]{Breaks} (User interrupts). It should be fairly straight-forward to support that by using the various @code{/enable-break} forms. The manager thread is also susceptible to bugs that would raise an exception and lead to the thread exiting @code{loop}, at which point @racket[catter-read] would still deadlock. The solution probably is to have a catch-all exception handler at the top-level that transitions to closed.
+The one gripe I have about the manager thread encapsulating the state (the 3 lists and one boolean in this case) is that I had to cram all the arguments to sync into one long block of code. It would be nice to refactor each event's handling into a function. However I don't know of a way to do that while not having to pass 4 arguments (and receive changed values) to every function.
 
-Comparison to Erlang, Python, Go.
-
-What about parallelism?
+In this demo I've chosen to focus on concurrency, but an application with sufficient scale could run multiple cat-file subprocesses.
