@@ -206,16 +206,13 @@
 (module+ main
   (define files
     (list
-     "content/post/2023/canadian-express-entry-experience.md"
-     "content/post/2023/gossip-glomers-racket.md"
-     "content/post/2023/gradient-descent-racket.m"
-     "content/post/2023/making-sense-of-continuations.md"
-     "content/post/2023/nuphy-air75-wireless-linux.md"
-     ))
+     "info.rkt"
+     "main.rkt"
+     "does-not-exist"))
 
-  (define commit "688600a4be5f016acfbf6c191562913b490ed687")
+  (define commit "master")
 
-  (define catter (make-catter "/home/nikhil/nikhilism.com"))
+  (define catter (make-catter (current-directory)))
   (define tasks (cons
                  (thread (lambda () (sleep 0.04) #;(catter-stop! catter)))
                  (for/list ([file files])
