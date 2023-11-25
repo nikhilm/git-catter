@@ -7,7 +7,7 @@
                     racket/string
                     racket/async-channel]]
 
-@title{A practical example of kill-safe, concurrent programming in Racket}
+@title{A practical introduction to kill-safe, concurrent programming in Racket}
 @author[(author+email "Nikhil Marathe" "me@nikhilism.com" #:obfuscate? #t)]
 
 @hyperlink["https://racket-lang.org"]{Racket's} default concurrency model is based on green threads. It uses a model based on ConcurrentML (CML), which is very similar to Go, but allows further composition of concurrency primitives. In @hyperlink["https://nikhilism.com/post/2023/racket-beyond-languages/#concurrentml-inspired-concurrency"]{one of my posts} I had given a quick summary of this and pointers to other resources. I thought it would be good to walk through building a somewhat useful concurrent program to show how to use it. As an experiment, this is written as a literate program, using @hyperlink["https://docs.racket-lang.org/scribble-lp2-manual/index.html"]{scribble/lp2/manual}.
